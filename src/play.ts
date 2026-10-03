@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import type { SpotifyHandlerExtra, tool } from './types.js';
-import { handleSpotifyRequest } from './utils.js';
+import {
+  formatDuration,
+  handleSpotifyRequest,
+  loadBookmarks,
+  saveBookmark,
+} from './utils.js';
 
 const playMusic: tool<{
   uri: z.ZodOptional<z.ZodString>;
@@ -183,13 +188,16 @@ const createPlaylist: tool<{
     const { name, description, public: isPublic = false } = args;
 
     const result = await handleSpotifyRequest(async (spotifyApi) => {
-      const me = await spotifyApi.currentUser.profile();
-
-      return await spotifyApi.playlists.createPlaylist(me.id, {
-        name,
-        description,
-        public: isPublic,
+      const token = await spotifyApi.getAccessToken();
+      const res = await fetch('https://api.spotify.com/v1/me/playlists', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token?.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ name, description, public: isPublic }),
       });
+      return await res.json();
     });
 
     return {
@@ -237,11 +245,21 @@ const addTracksToPlaylist: tool<{
       const trackUris = trackIds.map((id) => `spotify:track:${id}`);
 
       await handleSpotifyRequest(async (spotifyApi) => {
-        await spotifyApi.playlists.addItemsToPlaylist(
-          playlistId,
-          trackUris,
-          position,
+        const token = await spotifyApi.getAccessToken();
+        const body: Record<string, unknown> = { uris: trackUris };
+        if (position !== undefined) body.position = position;
+        const res = await fetch(
+          `https://api.spotify.com/v1/playlists/${playlistId}/items`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token?.access_token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+          },
         );
+        return await res.json();
       });
 
       return {
@@ -435,7 +453,6 @@ const adjustVolume: tool<{
     const { adjustment, deviceId } = args;
 
     try {
-      // First get the current playback state to find current volume
       const playback = await handleSpotifyRequest(async (spotifyApi) => {
         return await spotifyApi.player.getPlaybackState();
       });
@@ -496,8 +513,178 @@ const adjustVolume: tool<{
   },
 };
 
+const bookmarkPlaylist: tool<Record<string, never>> = {
+  name: 'bookmarkPlaylist',
+  description:
+    'Save the current playback position (playlist, track, and time) so you can resume this playlist later from the same spot with resumePlaylist',
+  schema: {},
+  handler: async (_args, _extra: SpotifyHandlerExtra) => {
+    try {
+      const state = await handleSpotifyRequest(async (spotifyApi) => {
+        const token = await spotifyApi.getAccessToken();
+        const res = await fetch('https://api.spotify.com/v1/me/player', {
+          headers: { Authorization: `Bearer ${token?.access_token}` },
+        });
+        if (res.status === 204) return null;
+        if (!res.ok) {
+          throw new Error(
+            `Spotify API error ${res.status}: ${await res.text()}`,
+          );
+        }
+        return await res.json();
+      });
+
+      if (!state?.item) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Nothing is currently playing, so there is no position to bookmark. Start a playlist first.',
+            },
+          ],
+        };
+      }
+
+      const context = state.context;
+      if (!context || context.type !== 'playlist') {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `The current playback isn't a playlist (it's ${
+                context?.type ?? 'unknown'
+              }), so it can't be bookmarked. Play a playlist first.`,
+            },
+          ],
+        };
+      }
+
+      const playlistUri: string = context.uri;
+      const playlistId = playlistUri.split(':').pop() ?? playlistUri;
+      const positionMs: number = state.progress_ms ?? 0;
+
+      saveBookmark(playlistId, {
+        playlistUri,
+        trackUri: state.item.uri,
+        trackName: state.item.name,
+        positionMs,
+        savedAt: new Date().toISOString(),
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Bookmarked playlist ${playlistId} at "${state.item.name}" (${formatDuration(
+              positionMs,
+            )}). Resume later with resumePlaylist({ playlistId: "${playlistId}" }).`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error bookmarking playlist: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          },
+        ],
+      };
+    }
+  },
+};
+
+const resumePlaylist: tool<{
+  playlistId: z.ZodString;
+  deviceId: z.ZodOptional<z.ZodString>;
+}> = {
+  name: 'resumePlaylist',
+  description:
+    'Resume a playlist from the position saved earlier by bookmarkPlaylist, starting at the saved track and time',
+  schema: {
+    playlistId: z.string().describe('The Spotify ID of the playlist to resume'),
+    deviceId: z
+      .string()
+      .optional()
+      .describe('The Spotify device ID to play on'),
+  },
+  handler: async (args, _extra: SpotifyHandlerExtra) => {
+    const { playlistId, deviceId } = args;
+
+    const bookmark = loadBookmarks()[playlistId];
+    if (!bookmark) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `No saved position for playlist ${playlistId}. Play it and run bookmarkPlaylist first.`,
+          },
+        ],
+      };
+    }
+
+    try {
+      await handleSpotifyRequest(async (spotifyApi) => {
+        const token = await spotifyApi.getAccessToken();
+        const url = new URL('https://api.spotify.com/v1/me/player/play');
+        if (deviceId) {
+          url.searchParams.set('device_id', deviceId);
+        }
+        const res = await fetch(url, {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${token?.access_token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            context_uri: bookmark.playlistUri,
+            offset: { uri: bookmark.trackUri },
+            position_ms: bookmark.positionMs,
+          }),
+        });
+        if (res.status === 404) {
+          throw new Error(
+            'No active Spotify device found. Open Spotify on a device (or pass deviceId) and try again.',
+          );
+        }
+        if (!res.ok) {
+          throw new Error(
+            `Spotify API error ${res.status}: ${await res.text()}`,
+          );
+        }
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Resumed playlist ${playlistId} at "${bookmark.trackName}" (${formatDuration(
+              bookmark.positionMs,
+            )}).`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error resuming playlist: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          },
+        ],
+      };
+    }
+  },
+};
+
 export const playTools = [
   playMusic,
+  bookmarkPlaylist,
+  resumePlaylist,
   pausePlayback,
   skipToNext,
   skipToPrevious,

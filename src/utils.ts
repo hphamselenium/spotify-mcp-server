@@ -46,6 +46,36 @@ export function saveSpotifyConfig(config: SpotifyConfig): void {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
 }
 
+const BOOKMARKS_FILE = path.join(__dirname, '../spotify-bookmarks.json');
+
+export interface PlaylistBookmark {
+  playlistUri: string;
+  trackUri: string;
+  trackName: string;
+  positionMs: number;
+  savedAt: string;
+}
+
+export function loadBookmarks(): Record<string, PlaylistBookmark> {
+  if (!fs.existsSync(BOOKMARKS_FILE)) {
+    return {};
+  }
+  try {
+    return JSON.parse(fs.readFileSync(BOOKMARKS_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+export function saveBookmark(
+  playlistId: string,
+  bookmark: PlaylistBookmark,
+): void {
+  const bookmarks = loadBookmarks();
+  bookmarks[playlistId] = bookmark;
+  fs.writeFileSync(BOOKMARKS_FILE, JSON.stringify(bookmarks, null, 2), 'utf8');
+}
+
 let cachedSpotifyApi: SpotifyApi | null = null;
 
 export async function createSpotifyApi(): Promise<SpotifyApi> {
