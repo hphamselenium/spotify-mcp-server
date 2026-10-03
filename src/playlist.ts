@@ -21,7 +21,18 @@ const getPlaylist: tool<{
 
       const owner =
         playlist.owner?.display_name ?? playlist.owner?.id ?? 'Unknown';
-      const tracksTotal = playlist.tracks?.total ?? 0;
+      // Spotify now omits `tracks` from the playlist object for this app, so
+      // read the count from the `/items` endpoint instead.
+      const tracksTotal = await handleSpotifyRequest(async (spotifyApi) => {
+        const token = await spotifyApi.getAccessToken();
+        const res = await fetch(
+          `https://api.spotify.com/v1/playlists/${playlistId}/items?limit=1`,
+          { headers: { Authorization: `Bearer ${token?.access_token}` } },
+        );
+        if (!res.ok) return playlist.tracks?.total ?? 0;
+        const data = await res.json();
+        return data.total ?? playlist.tracks?.total ?? 0;
+      });
       const isPublic = playlist.public ? 'Public' : 'Private';
       const isCollaborative = playlist.collaborative ? ' | Collaborative' : '';
       const description = playlist.description
